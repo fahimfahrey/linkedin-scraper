@@ -1,6 +1,8 @@
 # Playwright Setup Guide
 
-This guide helps resolve Playwright browser dependency issues on Ubuntu 24.04 and other Linux distributions.
+This guide helps resolve Playwright browser dependency issues on Ubuntu 24.04, 26.04, and other Linux distributions.
+
+> **Note:** The setup script (`scripts/setup-playwright-deps.sh`) now auto-detects your Ubuntu version and installs compatible package versions. Use this for the easiest setup.
 
 ## Quick Start (Recommended)
 
@@ -20,27 +22,46 @@ python -m playwright install
 python -c "from playwright.sync_api import sync_playwright; sync_playwright().stop()"
 ```
 
-### Option 2: Manual Installation
+### Option 2: Manual Installation (For Custom Environments)
 
-1. **Install system dependencies:**
+**Note:** The automated script (Option 1) handles version differences automatically. Use this only if the script doesn't work for your setup.
+
+1. **Update package lists:**
    ```bash
    sudo apt-get update
+   sudo apt-get upgrade -y
+   ```
+
+2. **Install core graphics dependencies:**
+   ```bash
    sudo apt-get install -y \
-     libc6 libxss1 libappindicator1 libgconf-2-4 libnss3 \
+     libc6 libxss1 libnss3 \
      libpangocairo-1.0-0 libpango-1.0-0 libxrender1 libx11-6 \
      libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
      libxext6 libxfixes3 libxi6 libxinerama1 libxrandr2 libxtst6 \
      libfontconfig1 libfreetype6 libhyphen0 libharfbuzz0b libopus0 \
-     libvpx9 libwebp7 libwoff1 libxml2 libxslt1.1 \
-     libicu74 libevent-2.1-7t64 libmanette-0.2-0
+     libwebp7 libwoff1 libxslt1.1
    ```
 
-2. **Install codecs (if needed):**
+3. **Install version-specific packages:**
+   Ubuntu 24.04 and earlier use: `libxml2 libappindicator1 libgconf-2-4 libvpx9 libicu74`
+   Ubuntu 26.04+ use: `libxml2-16 libayatana-appindicator3-1 libvpx12`
+   
+   **Try this to detect and install available versions:**
+   ```bash
+   for pkg in libxml2 libxml2-16 libappindicator1 libayatana-appindicator3-1 libvpx9 libvpx12 libicu74 libicu73; do
+     if apt-cache search "^$pkg\$" | grep -q .; then
+       sudo apt-get install -y "$pkg" || true
+     fi
+   done
+   ```
+
+4. **Install media codecs:**
    ```bash
    sudo apt-get install -y chromium-codecs-ffmpeg
    ```
 
-3. **Activate virtual environment and install Playwright:**
+5. **Activate virtual environment and install Playwright:**
    ```bash
    source venv/bin/activate
    python -m playwright install
@@ -50,12 +71,17 @@ python -c "from playwright.sync_api import sync_playwright; sync_playwright().st
 
 ### "Package not available" errors
 
-On Ubuntu 24.04, some older package versions may not exist. The setup script uses `2>/dev/null || true` to skip unavailable packages gracefully.
+On Ubuntu 24.04+, some package versions may not exist or have been renamed. The setup script now auto-detects your Ubuntu version and installs compatible packages.
 
-**If you see errors:**
-- Run: `sudo apt-get update && sudo apt-get upgrade`
-- Check available versions: `apt-cache search libicu | grep -i libicu`
-- Install available version instead: `sudo apt-get install libicu74` or `libicu73`
+**If you still see errors:**
+1. Run the automated setup script first: `./scripts/setup-playwright-deps.sh`
+2. Update and upgrade packages: `sudo apt-get update && sudo apt-get upgrade`
+3. Check available versions: `apt-cache search libicu | head -10`
+4. Install available version manually if needed
+
+**Version compatibility:**
+- Ubuntu 24.04: Uses `libxml2`, `libappindicator1`, `libvpx9`, `libicu74`
+- Ubuntu 26.04+: Uses `libxml2-16`, `libayatana-appindicator3-1`, `libvpx12`, `libicu73`+
 
 ### "Browser cache not found" after installation
 

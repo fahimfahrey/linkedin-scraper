@@ -32,8 +32,9 @@ pip install -r requirements.txt
 
 ### 4. Install Playwright Browsers & Dependencies
 
-#### Option A: Automated (Ubuntu/Debian)
+#### Option A: Automated (Ubuntu/Debian/24.04+)
 ```bash
+# The script auto-detects your Ubuntu version and installs compatible packages
 ./scripts/setup-playwright-deps.sh
 python -m playwright install
 ```
@@ -105,8 +106,9 @@ See [docs/PLAYWRIGHT_SETUP.md](docs/PLAYWRIGHT_SETUP.md) for:
 - Ensure virtual environment is activated: `source venv/bin/activate`
 - Reinstall: `pip install -r requirements.txt`
 
-**"Browser not found"**
-- Run: `python -m playwright install --with-deps`
+**"Browser not found" or "Package not available"**
+- First try: `./scripts/setup-playwright-deps.sh` (auto-detects your Ubuntu version)
+- Then: `python -m playwright install --with-deps`
 - Check: `~/.cache/ms-playwright/` contains browser files
 
 **Port 8501 already in use**
