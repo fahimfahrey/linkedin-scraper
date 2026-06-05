@@ -2,7 +2,10 @@
 import json
 import pytest
 import tempfile
+import queue
+import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from session_manager import SessionManager
 
@@ -59,3 +62,33 @@ def dummy_session_file(temp_session_file, dummy_session_state):
     with open(temp_session_file, "w") as f:
         json.dump(dummy_session_state, f)
     return temp_session_file
+
+
+@pytest.fixture
+def temp_message_queue():
+    """Create a temporary message queue for testing."""
+    return queue.Queue(maxsize=1000)
+
+
+@pytest.fixture
+def mock_scraper_worker():
+    """Create a mock ScraperWorker for testing."""
+    worker = MagicMock()
+    worker.is_alive.return_value = False
+    worker.message_queue = queue.Queue()
+    worker.worker_id = "test-worker"
+    return worker
+
+
+@pytest.fixture
+def app_session_state():
+    """Pre-initialized session state dict for testing."""
+    return {
+        "scraper_worker": None,
+        "collection_active": False,
+        "collected_profiles": [],
+        "status_log": [],
+        "thread_lock": threading.Lock(),
+        "current_warning": None,
+        "last_message_check": 0.0,
+    }

@@ -11,6 +11,8 @@ import logging
 import os
 import json
 import re
+import queue
+import threading
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -20,6 +22,8 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
 from bs4 import BeautifulSoup
 
+from queue_protocol import StatusUpdate, ProfilePayload, OperationWarning, ExecutionComplete
+from environment_config import get_chromium_environment
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +44,7 @@ class SecurityIncidentDetected(Exception):
 
 
 # Ubuntu Chromium environment configuration for headless Linux execution
-CHROMIUM_LAUNCH_ENV = {
-    "DISPLAY": os.environ.get("DISPLAY", ":99"),  # Xvfb for headless
-    "PATH": os.environ.get("PATH", ""),
-}
+CHROMIUM_LAUNCH_ENV = get_chromium_environment()
 
 
 # === Anti-Ban Guardrails ===
@@ -1069,3 +1070,153 @@ async def scrape_profile(context: BrowserContext, profile_url: str) -> Dict[str,
         Profile dictionary ready for database insertion.
     """
     return await traverse_profile(context, profile_url, expand_all=True)
+
+
+async def scrape_profile_batch(
+    urls: List[str],
+    message_queue: queue.Queue,
+    window_controller: ExecutionWindowController,
+    anomaly_detector: AnomalyDetector,
+    env: Optional[Dict[str, str]] = None,
+    worker_id: str = "default",
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    """
+    Batch scrape LinkedIn profiles and emit messages to queue.
+
+    Handles browser lifecycle, profile iteration, and error recovery.
+    All messages are sent to message_queue for UI consumption.
+
+    Args:
+        urls: List of LinkedIn profile URLs to scrape.
+        message_queue: Thread-safe queue for status/payload messages.
+        window_controller: ExecutionWindowController for daily limits.
+        anomaly_detector: AnomalyDetector for security monitoring.
+        env: OS environment dict for Chromium (overrides CHROMIUM_LAUNCH_ENV).
+        worker_id: Worker ID for message correlation.
+        stop_event: Threading event to signal graceful shutdown.
+    """
+    if env is None:
+        env = CHROMIUM_LAUNCH_ENV
+
+    p = None
+    browser = None
+    context = None
+    profiles_collected = 0
+    start_time = time.time()
+
+    try:
+        # Initialize controllers
+        await _init_controllers()
+
+        # Launch browser
+        p, browser = await launch_stealth_browser()
+        context = await create_stealth_context(browser)
+        logger.info(f"Browser launched for batch scrape ({len(urls)} profiles)")
+
+        # Iterate profiles
+        for idx, profile_url in enumerate(urls):
+            if stop_event and stop_event.is_set():
+                logger.info(f"Stop event received at profile {idx}/{len(urls)}")
+                break
+
+            try:
+                # Emit status: loading
+                status_msg = StatusUpdate(
+                    worker_id=worker_id,
+                    profile_url=profile_url,
+                    status="loading",
+                    elapsed_sec=time.time() - start_time,
+                )
+                message_queue.put(status_msg)
+
+                # Check execution window before scrape
+                await window_controller.check_and_increment()
+
+                # Scrape profile
+                profile_data = await scrape_profile(context, profile_url)
+
+                # Emit status: stored
+                status_msg = StatusUpdate(
+                    worker_id=worker_id,
+                    profile_url=profile_url,
+                    status="stored",
+                    elapsed_sec=time.time() - start_time,
+                )
+                message_queue.put(status_msg)
+
+                # Emit profile payload
+                payload_msg = ProfilePayload(
+                    worker_id=worker_id,
+                    profile_data=profile_data,
+                    url=profile_url,
+                )
+                message_queue.put(payload_msg)
+
+                profiles_collected += 1
+                logger.info(f"Profile {idx+1}/{len(urls)} collected: {profile_url}")
+
+                # Humanized delay
+                humanized_sleep(3.0, 5.0)
+
+            except ExecutionWindowExceeded as e:
+                logger.error(f"Execution window exceeded at profile {idx}: {e}")
+                warn_msg = OperationWarning(
+                    worker_id=worker_id,
+                    severity="critical",
+                    message=f"Daily limit reached: {str(e)}",
+                    action="shutdown",
+                )
+                message_queue.put(warn_msg)
+                break
+
+            except SecurityIncidentDetected as e:
+                logger.error(f"Security incident at profile {idx}: {e.anomaly_type}")
+                warn_msg = OperationWarning(
+                    worker_id=worker_id,
+                    severity="critical",
+                    message=f"Security incident: {e.anomaly_type}",
+                    action="shutdown",
+                )
+                message_queue.put(warn_msg)
+                break
+
+            except Exception as e:
+                logger.warning(f"Failed to scrape profile {idx} ({profile_url}): {e}")
+                # Emit warning but continue
+                warn_msg = OperationWarning(
+                    worker_id=worker_id,
+                    severity="warning",
+                    message=f"Profile scrape failed: {str(e)[:100]}",
+                    action="continue",
+                )
+                message_queue.put(warn_msg)
+
+        # Emit completion
+        complete_msg = ExecutionComplete(
+            worker_id=worker_id,
+            success=True,
+            profiles_collected=profiles_collected,
+            total_queued=len(urls),
+        )
+        message_queue.put(complete_msg)
+        logger.info(f"Batch scrape complete: {profiles_collected}/{len(urls)} collected")
+
+    except Exception as e:
+        logger.error(f"Batch scrape failed with fatal error: {e}", exc_info=True)
+        complete_msg = ExecutionComplete(
+            worker_id=worker_id,
+            success=False,
+            profiles_collected=profiles_collected,
+            total_queued=len(urls),
+            error_type=type(e).__name__,
+            details={"error": str(e)},
+        )
+        message_queue.put(complete_msg)
+
+    finally:
+        # Cleanup browser
+        await safe_browser_cleanup(browser, context)
+        if p:
+            await p.stop()
+        logger.info(f"Worker {worker_id} cleanup complete")

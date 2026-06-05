@@ -5,11 +5,16 @@ import json
 from datetime import datetime
 import pandas as pd
 import asyncio
+import threading
+import time
 from typing import Optional
 
 # Import local modules
 from database import get_profiles_df, init_db
 from session_manager import SessionManager
+from thread_manager import ScraperWorker
+from environment_config import get_chromium_environment
+from scraper import ExecutionWindowController, AnomalyDetector
 import ui_helpers
 import export_helpers
 
@@ -41,6 +46,22 @@ if "bulk_urls" not in st.session_state:
     st.session_state.bulk_urls = ""
 if "last_queue_time" not in st.session_state:
     st.session_state.last_queue_time = None
+
+# Thread control state
+if "scraper_worker" not in st.session_state:
+    st.session_state.scraper_worker = None
+if "collection_active" not in st.session_state:
+    st.session_state.collection_active = False
+if "collected_profiles" not in st.session_state:
+    st.session_state.collected_profiles = []
+if "status_log" not in st.session_state:
+    st.session_state.status_log = []
+if "thread_lock" not in st.session_state:
+    st.session_state.thread_lock = threading.Lock()
+if "current_warning" not in st.session_state:
+    st.session_state.current_warning = None
+if "last_message_check" not in st.session_state:
+    st.session_state.last_message_check = 0.0
 
 
 @st.cache_data(ttl=600)
@@ -75,10 +96,63 @@ with st.sidebar:
                 st.sidebar.error(f"Error: {str(e)[:100]}")
 
 
+# === Message Consumer Loop ===
+if st.session_state.scraper_worker and st.session_state.collection_active:
+    # Non-blocking message pull with rerun trigger
+    if time.time() - st.session_state.last_message_check > 0.1:
+        message = st.session_state.scraper_worker.get_next_message(timeout=0.05)
+        if message:
+            from queue_protocol import StatusUpdate, ProfilePayload, OperationWarning, ExecutionComplete
+
+            if isinstance(message, StatusUpdate):
+                # Log status updates
+                log_entry = f"[{message.status}] {message.profile_url} ({message.elapsed_sec:.1f}s)"
+                st.session_state.status_log.append(log_entry)
+                # Keep only last 50
+                if len(st.session_state.status_log) > 50:
+                    st.session_state.status_log = st.session_state.status_log[-50:]
+
+            elif isinstance(message, ProfilePayload):
+                # Add profile to collected list (thread-safe)
+                with st.session_state.thread_lock:
+                    st.session_state.collected_profiles.append(message.profile_data)
+
+            elif isinstance(message, OperationWarning):
+                # Store warning for UI display
+                st.session_state.current_warning = message
+
+            elif isinstance(message, ExecutionComplete):
+                # Mark collection as complete
+                st.session_state.collection_active = False
+                if message.success:
+                    logger.info(f"Collection complete: {message.profiles_collected}/{message.total_queued}")
+                else:
+                    logger.error(f"Collection failed: {message.error_type} - {message.details}")
+
+        st.session_state.last_message_check = time.time()
+
+        # Trigger rerun to refresh UI
+        time.sleep(0.01)
+        st.rerun()
+
+
 # === MAIN CONTENT ===
 st.markdown("## 📊 LinkedIn Lead Acquisition Dashboard")
 
-tab1, tab2 = st.tabs(["📥 Input & Auth", "📈 Analytics"])
+# Show collection status if active
+if st.session_state.collection_active:
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.info("⏳ Collection in progress. Inputs frozen.")
+    with col2:
+        if st.button("⏹️ Cancel", key="cancel_scrape"):
+            if st.session_state.scraper_worker:
+                st.session_state.scraper_worker.terminate()
+            st.session_state.collection_active = False
+            st.success("Collection cancelled")
+            st.rerun()
+
+tab1, tab2, tab3 = st.tabs(["📥 Input & Auth", "📈 Analytics", "📊 Live Status"])
 
 # --- TAB 1: INPUT & AUTH ---
 with tab1:
@@ -92,6 +166,7 @@ with tab1:
             height=200,
             placeholder="https://www.linkedin.com/in/username\nhttps://www.linkedin.com/in/another-user",
             help="URLs will be parsed and queued for scraping",
+            disabled=st.session_state.collection_active,
         )
 
     with col2:
@@ -113,9 +188,24 @@ with tab1:
                 + "\n".join([f"  • {u[:60]}" for u in invalid_urls[:5]])
             )
 
-        if st.button("🚀 Queue for Scraping", use_container_width=True, key="queue_urls"):
-            st.info(f"✅ Queued {len(valid_urls)} profiles for scraping")
+        if st.button("🚀 Queue for Scraping", use_container_width=True, key="queue_urls",
+                     disabled=st.session_state.collection_active):
+            # Spawn worker thread
+            worker = ScraperWorker()
+            worker.spawn(
+                valid_urls,
+                env=get_chromium_environment(),
+                window_controller=ExecutionWindowController(),
+                anomaly_detector=AnomalyDetector(),
+            )
+            st.session_state.scraper_worker = worker
+            st.session_state.collection_active = True
+            st.session_state.collected_profiles = []
+            st.session_state.status_log = []
+            st.session_state.current_warning = None
+            st.info(f"✅ Queued {len(valid_urls)} profiles for scraping. Collection starting...")
             st.session_state.last_queue_time = datetime.now()
+            st.rerun()
 
     st.divider()
     st.markdown("### Manual Authentication")
@@ -198,3 +288,46 @@ with tab2:
 
     else:
         st.info("No profiles collected yet. Queue URLs in the Input tab to begin.")
+
+
+# --- TAB 3: LIVE STATUS ---
+with tab3:
+    st.markdown("### 📊 Live Collection Status")
+
+    if st.session_state.collection_active:
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Profiles Collected", len(st.session_state.collected_profiles))
+
+        with col2:
+            st.metric("Status Updates", len(st.session_state.status_log))
+
+        with col3:
+            if st.session_state.scraper_worker:
+                st.metric("Worker Active", "🟢 Running" if st.session_state.scraper_worker.is_alive() else "🟡 Stopping")
+
+        st.divider()
+
+        # Display warnings if any
+        if st.session_state.current_warning:
+            warning = st.session_state.current_warning
+            if warning.severity == "critical":
+                st.error(f"⚠️ {warning.message}")
+            elif warning.severity == "warning":
+                st.warning(f"⚠️ {warning.message}")
+            else:
+                st.info(f"ℹ️ {warning.message}")
+
+        st.divider()
+
+        # Recent activity log
+        st.markdown("### Recent Activity")
+        if st.session_state.status_log:
+            for log in st.session_state.status_log[-15:]:
+                st.caption(log)
+        else:
+            st.caption("No activity yet...")
+
+    else:
+        st.info("No active collection. Queue URLs in the Input tab to start.")
