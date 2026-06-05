@@ -1,5 +1,6 @@
 """Pytest configuration and fixtures for session manager tests."""
 import json
+import os
 import pytest
 import tempfile
 import queue
@@ -8,6 +9,40 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from session_manager import SessionManager
+from src.browser_config import get_browser_launch_args
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(path=None):
+        """Fallback if python-dotenv not installed."""
+        if path and os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        os.environ[key.strip()] = value.strip()
+
+
+def pytest_configure(config):
+    """Load environment variables from .env.test before tests run."""
+    env_file = os.path.join(os.path.dirname(__file__), "..", ".env.test")
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+
+    # Fallback if env var not set
+    if not os.environ.get("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"):
+        os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
+
+
+@pytest.fixture(scope="session")
+def playwright_browser_launch_args():
+    """
+    Return Playwright launch arguments with manual Chromium path.
+    Fixture overrides default Playwright fixture behavior.
+    """
+    return get_browser_launch_args()
 
 
 @pytest.fixture
