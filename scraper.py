@@ -9,14 +9,34 @@ import random
 import time
 import logging
 import os
-from typing import Optional, Dict, List
+import json
+import re
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional, Dict, List, Any
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
+from bs4 import BeautifulSoup
 
 
 logger = logging.getLogger(__name__)
+
+
+# === Custom Exceptions ===
+
+class ExecutionWindowExceeded(Exception):
+    """Raised when daily profile limit reached."""
+    pass
+
+
+class SecurityIncidentDetected(Exception):
+    """Raised when anomaly interception triggered."""
+    def __init__(self, anomaly_type: str, details: dict):
+        self.anomaly_type = anomaly_type
+        self.details = details
+        super().__init__(f"Security incident: {anomaly_type}")
 
 
 # Ubuntu Chromium environment configuration for headless Linux execution
@@ -24,6 +44,214 @@ CHROMIUM_LAUNCH_ENV = {
     "DISPLAY": os.environ.get("DISPLAY", ":99"),  # Xvfb for headless
     "PATH": os.environ.get("PATH", ""),
 }
+
+
+# === Anti-Ban Guardrails ===
+
+class ExecutionWindowController:
+    """Tracks daily profile count and enforces hard limits."""
+
+    def __init__(self, max_profiles_per_day: int = 45, state_file: str = "execution_window.json"):
+        self.max_profiles_per_day = max_profiles_per_day
+        self.state_file = state_file
+        self.state = self._load_state()
+
+    def _load_state(self) -> dict:
+        """Load state from JSON file, handle missing/corrupted files."""
+        try:
+            if Path(self.state_file).exists():
+                with open(self.state_file, "r") as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load state file {self.state_file}: {e}. Reinitializing.")
+        return {"date": str(date.today()), "count": 0, "reset_count": 0}
+
+    def _save_state(self) -> None:
+        """Save state to JSON file atomically."""
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(self.state, f, indent=2)
+        except IOError as e:
+            logger.error(f"Failed to save state: {e}")
+
+    async def reset_if_new_day(self) -> None:
+        """Check date, reset counter if new day detected."""
+        today = str(date.today())
+        if self.state.get("date") != today:
+            self.state = {"date": today, "count": 0, "reset_count": self.state.get("reset_count", 0) + 1}
+            self._save_state()
+            logger.info(f"Execution window reset: new day detected. Reset count: {self.state['reset_count']}")
+
+    async def check_and_increment(self) -> bool:
+        """
+        Increment counter, check if under limit.
+
+        Returns:
+            True if under limit, False otherwise.
+
+        Raises:
+            ExecutionWindowExceeded: If at or over limit.
+        """
+        await self.reset_if_new_day()
+
+        if self.state["count"] >= self.max_profiles_per_day:
+            logger.warning(f"Daily limit reached: {self.state['count']}/{self.max_profiles_per_day}")
+            raise ExecutionWindowExceeded(
+                f"Daily profile limit ({self.max_profiles_per_day}) exceeded"
+            )
+
+        self.state["count"] += 1
+
+        # Log warning at 35+ profiles
+        if self.state["count"] >= 35:
+            logger.warning(
+                f"Daily limit approaching: {self.state['count']}/{self.max_profiles_per_day} profiles"
+            )
+
+        self._save_state()
+        return True
+
+
+class AnomalyDetector:
+    """Detects suspicious platform responses (CAPTCHA, logout, rate limits, redirects)."""
+
+    def __init__(self):
+        # Precompile regex patterns for performance
+        self.captcha_pattern = re.compile(r"recaptcha|hcaptcha|challenge", re.IGNORECASE)
+        self.logout_pattern = re.compile(r"sign.?in|log.?in", re.IGNORECASE)
+        self.rate_limit_pattern = re.compile(
+            r"rate.?limit|too.?many|slow.?down|try.?again", re.IGNORECASE
+        )
+        self.known_paths = {"/in/", "/company/", "/search/", "/jobs/"}
+        self.url_history = []
+
+    async def inspect_page(self, page: Page) -> Optional[str]:
+        """
+        Run all detection patterns on page.
+
+        Returns:
+            Anomaly type string ('captcha', 'forced_logout', 'rate_limit', 'redirect_anomaly')
+            or None if no anomaly detected.
+        """
+        try:
+            page_content = await page.content()
+            page_url = page.url
+            page_title = await page.title()
+
+            # Check for CAPTCHA
+            if self._detect_captcha(page_content, page_url, page_title):
+                logger.critical("SECURITY INCIDENT: CAPTCHA detected. Emergency shutdown initiated.")
+                return "captcha"
+
+            # Check for forced logout
+            if self._detect_logout(page_url, page_title):
+                logger.critical("SECURITY INCIDENT: Forced logout detected. Emergency shutdown initiated.")
+                return "forced_logout"
+
+            # Check for rate limit
+            if self._detect_rate_limit(page_content):
+                logger.critical("SECURITY INCIDENT: Rate limit detected. Emergency shutdown initiated.")
+                return "rate_limit"
+
+            # Check for redirect anomaly
+            if self._detect_redirect_anomaly(page_url):
+                logger.critical("SECURITY INCIDENT: Redirect anomaly detected. Emergency shutdown initiated.")
+                return "redirect_anomaly"
+
+            return None
+        except Exception as e:
+            logger.warning(f"Anomaly detection failed: {e}")
+            return None
+
+    def _detect_captcha(self, page_content: str, page_url: str, page_title: str) -> bool:
+        """Detect CAPTCHA iframe or challenge elements."""
+        # Regex check on content
+        if self.captcha_pattern.search(page_content):
+            return True
+        # URL check
+        if "challenge" in page_url.lower():
+            return True
+        # Title check
+        if "verify" in page_title.lower() or "security" in page_title.lower():
+            return True
+        return False
+
+    def _detect_logout(self, page_url: str, page_title: str) -> bool:
+        """Detect forced logout (URL/title patterns)."""
+        if "/login" in page_url or "/signup" in page_url:
+            return True
+        if self.logout_pattern.search(page_title):
+            return True
+        return False
+
+    def _detect_rate_limit(self, page_content: str) -> bool:
+        """Detect rate limit text in page."""
+        return bool(self.rate_limit_pattern.search(page_content))
+
+    def _detect_redirect_anomaly(self, current_url: str) -> bool:
+        """Track URL history, detect deviation from known paths."""
+        self.url_history.append(current_url)
+
+        # Check if URL deviates from known LinkedIn profile paths
+        is_valid = any(path in current_url for path in self.known_paths)
+        if not is_valid and len(self.url_history) > 1:
+            # Allow initial navigation, but detect soft redirects
+            prev_url = self.url_history[-2] if len(self.url_history) > 1 else None
+            if prev_url and prev_url != current_url and "linkedin.com" in current_url:
+                # Unexpected redirect detected
+                if "/error" in current_url or "session" in current_url:
+                    return True
+        return False
+
+
+async def safe_browser_cleanup(browser, context) -> None:
+    """
+    Gracefully close browser and context. Fallback to OS-level termination if needed.
+
+    Never raises exceptions — logs errors and continues.
+    """
+    try:
+        if context:
+            await context.close()
+            logger.debug("Browser context closed")
+    except Exception as e:
+        logger.warning(f"Context close failed: {e}")
+
+    try:
+        if browser:
+            await browser.close()
+            logger.debug("Browser closed")
+    except Exception as e:
+        logger.warning(f"Browser close failed: {e}")
+        # Fallback: attempt OS-level process termination
+        try:
+            import subprocess
+            import psutil
+
+            # Find Chromium process by parent/name
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if "chrome" in proc.info["name"].lower():
+                        proc.terminate()
+                        logger.info(f"Terminated orphaned process: {proc.info['pid']}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            logger.warning("psutil not available for fallback cleanup")
+
+
+# Module-level singletons
+_WINDOW_CONTROLLER: Optional[ExecutionWindowController] = None
+_ANOMALY_DETECTOR: Optional[AnomalyDetector] = None
+
+
+async def _init_controllers() -> None:
+    """Initialize global controllers on first use."""
+    global _WINDOW_CONTROLLER, _ANOMALY_DETECTOR
+    if _WINDOW_CONTROLLER is None:
+        _WINDOW_CONTROLLER = ExecutionWindowController()
+        _ANOMALY_DETECTOR = AnomalyDetector()
+    await _WINDOW_CONTROLLER.reset_if_new_day()
 
 
 async def launch_stealth_browser():
@@ -260,6 +488,15 @@ async def traverse_profile(
         await page.goto(profile_url, wait_until="networkidle", timeout=30000)
         logger.info("Profile page loaded")
 
+        # Anomaly detection post-navigation
+        anomaly = await _ANOMALY_DETECTOR.inspect_page(page)
+        if anomaly:
+            raise SecurityIncidentDetected(anomaly, {
+                "profile_url": profile_url,
+                "page_url": page.url,
+                "timestamp": datetime.now().isoformat()
+            })
+
         # Simulate initial user behavior
         humanized_sleep(2.0, 4.5)
         await simulate_mouse_movement(page)
@@ -291,6 +528,457 @@ async def traverse_profile(
     finally:
         if page:
             await page.close()
+
+
+def extract_full_name(soup: BeautifulSoup, default: str = "") -> str:
+	"""
+	Extract full name from profile using semantic containers.
+
+	Tries multiple extraction strategies:
+	1. h1 tag (primary semantic header)
+	2. JSON-LD Person schema
+	3. Open Graph name meta tag
+	4. aria-labeled heading elements
+
+	Args:
+		soup: BeautifulSoup object of parsed HTML
+		default: Default value if extraction fails
+
+	Returns:
+		Extracted full name or default
+	"""
+	try:
+		# Strategy 1: Primary h1 heading
+		h1 = soup.select_one("h1")
+		if h1:
+			name = h1.get_text(strip=True)
+			if name and len(name) > 1:
+				logger.debug(f"Name extracted from h1: {name}")
+				return name
+	except Exception as e:
+		logger.debug(f"h1 extraction failed: {e}")
+
+	try:
+		# Strategy 2: JSON-LD Person schema
+		ld_json = soup.find("script", {"type": "application/ld+json"})
+		if ld_json:
+			data = json.loads(ld_json.string)
+			if isinstance(data, dict) and "name" in data:
+				name = data.get("name", "").strip()
+				if name:
+					logger.debug(f"Name extracted from JSON-LD: {name}")
+					return name
+	except Exception as e:
+		logger.debug(f"JSON-LD extraction failed: {e}")
+
+	try:
+		# Strategy 3: Open Graph meta tag
+		og_name = soup.select_one("meta[property='og:title']")
+		if og_name:
+			name = og_name.get("content", "").strip()
+			if name:
+				logger.debug(f"Name extracted from og:title: {name}")
+				return name
+	except Exception as e:
+		logger.debug(f"og:title extraction failed: {e}")
+
+	logger.warning("Full name extraction failed, returning default")
+	return default
+
+
+def extract_headline(soup: BeautifulSoup, default: str = "") -> str:
+	"""
+	Extract headline (job title + company) from profile.
+
+	Tries multiple extraction strategies:
+	1. Semantic div with id containing 'headline'
+	2. JSON-LD jobTitle field
+	3. Meta description prefix
+	4. Paragraph following h1
+
+	Args:
+		soup: BeautifulSoup object of parsed HTML
+		default: Default value if extraction fails
+
+	Returns:
+		Extracted headline or default
+	"""
+	try:
+		# Strategy 1: Semantic headline container
+		headline_div = soup.select_one("div[id*='headline']")
+		if headline_div:
+			headline = headline_div.get_text(strip=True)
+			if headline and len(headline) > 2:
+				logger.debug(f"Headline extracted from semantic div: {headline}")
+				return headline
+	except Exception as e:
+		logger.debug(f"Semantic headline extraction failed: {e}")
+
+	try:
+		# Strategy 2: JSON-LD jobTitle
+		ld_json = soup.find("script", {"type": "application/ld+json"})
+		if ld_json:
+			data = json.loads(ld_json.string)
+			job_title = data.get("jobTitle", "").strip()
+			if job_title:
+				logger.debug(f"Headline extracted from JSON-LD: {job_title}")
+				return job_title
+	except Exception as e:
+		logger.debug(f"JSON-LD jobTitle extraction failed: {e}")
+
+	try:
+		# Strategy 3: Meta description (often contains headline)
+		meta_desc = soup.select_one("meta[name='description']")
+		if meta_desc:
+			desc = meta_desc.get("content", "").strip()
+			if desc and len(desc) > 5:
+				# Extract first sentence/clause as headline
+				headline = desc.split(" | ")[0].strip()
+				logger.debug(f"Headline extracted from meta: {headline}")
+				return headline
+	except Exception as e:
+		logger.debug(f"Meta description extraction failed: {e}")
+
+	try:
+		# Strategy 4: Paragraph following h1
+		h1 = soup.select_one("h1")
+		if h1:
+			p = h1.find_next("p")
+			if p:
+				headline = p.get_text(strip=True)
+				if headline:
+					logger.debug(f"Headline extracted from post-h1 paragraph: {headline}")
+					return headline
+	except Exception as e:
+		logger.debug(f"Post-h1 paragraph extraction failed: {e}")
+
+	logger.warning("Headline extraction failed, returning default")
+	return default
+
+
+def extract_current_workplace(soup: BeautifulSoup, default: str = "") -> str:
+	"""
+	Extract current workplace/company from profile.
+
+	Tries multiple extraction strategies:
+	1. JSON-LD worksFor.name
+	2. Semantic experience section current company
+	3. og:site_name
+	4. Strong tags in experience container
+
+	Args:
+		soup: BeautifulSoup object of parsed HTML
+		default: Default value if extraction fails
+
+	Returns:
+		Extracted current workplace or default
+	"""
+	try:
+		# Strategy 1: JSON-LD worksFor
+		ld_json = soup.find("script", {"type": "application/ld+json"})
+		if ld_json:
+			data = json.loads(ld_json.string)
+			works_for = data.get("worksFor", {})
+			if isinstance(works_for, dict):
+				company = works_for.get("name", "").strip()
+			elif isinstance(works_for, list) and works_for:
+				company = works_for[0].get("name", "").strip() if isinstance(works_for[0], dict) else ""
+			else:
+				company = ""
+
+			if company:
+				logger.debug(f"Workplace extracted from JSON-LD: {company}")
+				return company
+	except Exception as e:
+		logger.debug(f"JSON-LD worksFor extraction failed: {e}")
+
+	try:
+		# Strategy 2: Experience section with 'current' marker
+		exp_section = soup.select_one("section[id*='experience']")
+		if exp_section:
+			# Look for current employment indicators
+			current = exp_section.select_one("[class*='current'], [data-test*='current']")
+			if current:
+				company = current.get_text(strip=True)
+				if company:
+					logger.debug(f"Workplace extracted from experience section: {company}")
+					return company
+	except Exception as e:
+		logger.debug(f"Experience section extraction failed: {e}")
+
+	try:
+		# Strategy 3: Strong tag in experience (often company name)
+		exp_section = soup.select_one("section[id*='experience']")
+		if exp_section:
+			strong = exp_section.select_one("strong")
+			if strong:
+				company = strong.get_text(strip=True)
+				if company and len(company) > 1:
+					logger.debug(f"Workplace extracted from strong tag: {company}")
+					return company
+	except Exception as e:
+		logger.debug(f"Strong tag extraction failed: {e}")
+
+	logger.warning("Workplace extraction failed, returning default")
+	return default
+
+
+def extract_jobs_array(soup: BeautifulSoup, default: List[Dict[str, str]] = None) -> List[Dict[str, str]]:
+	"""
+	Extract array of job positions from experience section.
+
+	Parses experience section for structured job data:
+	- job title
+	- company name
+	- duration/dates
+	- description (if available)
+
+	Args:
+		soup: BeautifulSoup object of parsed HTML
+		default: Default value if extraction fails
+
+	Returns:
+		List of job dictionaries or default empty list
+	"""
+	if default is None:
+		default = []
+
+	try:
+		# Strategy 1: JSON-LD workHistory
+		ld_json = soup.find("script", {"type": "application/ld+json"})
+		if ld_json:
+			data = json.loads(ld_json.string)
+			work_history = data.get("workHistory", [])
+			if work_history and isinstance(work_history, list):
+				jobs = []
+				for job in work_history:
+					if isinstance(job, dict):
+						jobs.append({
+							"title": job.get("position", ""),
+							"company": job.get("organization", {}).get("name", "") if isinstance(job.get("organization"), dict) else "",
+							"duration": f"{job.get('startDate', '')} - {job.get('endDate', '')}",
+							"description": job.get("description", "")
+						})
+				if jobs:
+					logger.debug(f"Extracted {len(jobs)} jobs from JSON-LD")
+					return jobs
+	except Exception as e:
+		logger.debug(f"JSON-LD workHistory extraction failed: {e}")
+
+	try:
+		# Strategy 2: Experience section list items
+		exp_section = soup.select_one("section[id*='experience'], div[id*='experience']")
+		if exp_section:
+			job_items = exp_section.select("li, div[class*='experience-item'], article")
+			jobs = []
+
+			for item in job_items:
+				try:
+					title_elem = item.select_one("h3, strong, [class*='title']")
+					company_elem = item.select_one("[class*='company'], span:nth-of-type(2)")
+					duration_elem = item.select_one("[class*='date'], span:nth-of-type(3)")
+
+					job = {
+						"title": title_elem.get_text(strip=True) if title_elem else "",
+						"company": company_elem.get_text(strip=True) if company_elem else "",
+						"duration": duration_elem.get_text(strip=True) if duration_elem else "",
+						"description": ""
+					}
+
+					if job["title"] or job["company"]:
+						jobs.append(job)
+				except Exception as item_err:
+					logger.debug(f"Job item parsing failed: {item_err}")
+					continue
+
+			if jobs:
+				logger.debug(f"Extracted {len(jobs)} jobs from experience section")
+				return jobs
+	except Exception as e:
+		logger.debug(f"Experience section extraction failed: {e}")
+
+	logger.warning("Jobs array extraction failed, returning default")
+	return default
+
+
+def extract_schools_array(soup: BeautifulSoup, default: List[Dict[str, str]] = None) -> List[Dict[str, str]]:
+	"""
+	Extract array of education entries from education section.
+
+	Parses education section for structured school data:
+	- school name
+	- degree
+	- field of study
+	- graduation year
+	- activities/societies
+
+	Args:
+		soup: BeautifulSoup object of parsed HTML
+		default: Default value if extraction fails
+
+	Returns:
+		List of school dictionaries or default empty list
+	"""
+	if default is None:
+		default = []
+
+	try:
+		# Strategy 1: JSON-LD alumniOf / educationDetails
+		ld_json = soup.find("script", {"type": "application/ld+json"})
+		if ld_json:
+			data = json.loads(ld_json.string)
+
+			# Try alumniOf first
+			alumni_of = data.get("alumniOf", [])
+			if alumni_of and isinstance(alumni_of, list):
+				schools = []
+				for school in alumni_of:
+					if isinstance(school, dict):
+						schools.append({
+							"school": school.get("name", ""),
+							"degree": school.get("degree", ""),
+							"field": school.get("field", ""),
+							"year": school.get("year", "")
+						})
+				if schools:
+					logger.debug(f"Extracted {len(schools)} schools from JSON-LD alumniOf")
+					return schools
+	except Exception as e:
+		logger.debug(f"JSON-LD alumniOf extraction failed: {e}")
+
+	try:
+		# Strategy 2: Education section list items
+		edu_section = soup.select_one("section[id*='education'], div[id*='education']")
+		if edu_section:
+			school_items = edu_section.select("li, div[class*='education-item'], article")
+			schools = []
+
+			for item in school_items:
+				try:
+					school_elem = item.select_one("h3, strong, [class*='school']")
+					degree_elem = item.select_one("[class*='degree']")
+					field_elem = item.select_one("[class*='field'], span:nth-of-type(2)")
+					year_elem = item.select_one("[class*='year'], span:nth-of-type(3)")
+
+					school = {
+						"school": school_elem.get_text(strip=True) if school_elem else "",
+						"degree": degree_elem.get_text(strip=True) if degree_elem else "",
+						"field": field_elem.get_text(strip=True) if field_elem else "",
+						"year": year_elem.get_text(strip=True) if year_elem else ""
+					}
+
+					if school["school"]:
+						schools.append(school)
+				except Exception as item_err:
+					logger.debug(f"School item parsing failed: {item_err}")
+					continue
+
+			if schools:
+				logger.debug(f"Extracted {len(schools)} schools from education section")
+				return schools
+	except Exception as e:
+		logger.debug(f"Education section extraction failed: {e}")
+
+	logger.warning("Schools array extraction failed, returning default")
+	return default
+
+
+async def extract_profile_with_beautifulsoup(page: Page, profile_url: str) -> Dict[str, Any]:
+	"""
+	Extract profile data using BeautifulSoup4 with lxml parser.
+
+	Gets page HTML from Playwright and parses with BeautifulSoup,
+	using high-reliability targets like JSON-LD and semantic containers
+	instead of volatile CSS classes.
+
+	Each extraction segment isolated in try/except to prevent single
+	missing elements from crashing the pipeline.
+
+	Args:
+		page: Playwright Page instance after full traversal
+		profile_url: Profile URL for reference
+
+	Returns:
+		Dictionary with extracted profile data
+	"""
+	profile_data = {
+		"linkedin_url": profile_url,
+		"full_name": "",
+		"headline": "",
+		"current_workplace": "",
+		"location": "",
+		"about_text": "",
+		"jobs": [],
+		"schools": [],
+	}
+
+	try:
+		# Get full page HTML from Playwright
+		html_content = await page.content()
+		soup = BeautifulSoup(html_content, "lxml")
+		logger.debug("Page HTML parsed with BeautifulSoup lxml parser")
+
+	except Exception as e:
+		logger.error(f"Failed to parse page with BeautifulSoup: {e}")
+		return profile_data
+
+	# Extract full name with fail-safe closure
+	try:
+		profile_data["full_name"] = extract_full_name(soup)
+	except Exception as e:
+		logger.error(f"Full name extraction error: {e}")
+		profile_data["full_name"] = ""
+
+	# Extract headline with fail-safe closure
+	try:
+		profile_data["headline"] = extract_headline(soup)
+	except Exception as e:
+		logger.error(f"Headline extraction error: {e}")
+		profile_data["headline"] = ""
+
+	# Extract current workplace with fail-safe closure
+	try:
+		profile_data["current_workplace"] = extract_current_workplace(soup)
+	except Exception as e:
+		logger.error(f"Workplace extraction error: {e}")
+		profile_data["current_workplace"] = ""
+
+	# Extract location with fail-safe closure
+	try:
+		location_elem = soup.select_one("div[id*='location'], [data-test*='location'], span[class*='location']")
+		if location_elem:
+			profile_data["location"] = location_elem.get_text(strip=True)
+	except Exception as e:
+		logger.error(f"Location extraction error: {e}")
+		profile_data["location"] = ""
+
+	# Extract about section with fail-safe closure
+	try:
+		about_section = soup.select_one("section[id*='about'], div[id*='about']")
+		if about_section:
+			about_p = about_section.select_one("p")
+			if about_p:
+				profile_data["about_text"] = about_p.get_text(strip=True)
+	except Exception as e:
+		logger.error(f"About section extraction error: {e}")
+		profile_data["about_text"] = ""
+
+	# Extract jobs array with fail-safe closure
+	try:
+		profile_data["jobs"] = extract_jobs_array(soup)
+	except Exception as e:
+		logger.error(f"Jobs array extraction error: {e}")
+		profile_data["jobs"] = []
+
+	# Extract schools array with fail-safe closure
+	try:
+		profile_data["schools"] = extract_schools_array(soup)
+	except Exception as e:
+		logger.error(f"Schools array extraction error: {e}")
+		profile_data["schools"] = []
+
+	logger.info(f"Profile extraction complete: {profile_data.get('full_name', 'unknown')} from {profile_url}")
+	return profile_data
 
 
 async def extract_profile_metadata(page: Page, profile_url: str) -> Dict[str, any]:
