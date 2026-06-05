@@ -45,6 +45,40 @@ def playwright_browser_launch_args():
     return get_browser_launch_args()
 
 
+@pytest.fixture(scope="session")
+def browser_context_args():
+    """Return context args for Playwright fixtures."""
+    return {
+        "viewport": {"width": 1280, "height": 720},
+        "ignore_https_errors": True,
+    }
+
+
+@pytest.fixture(scope="function")
+async def browser(playwright_browser_launch_args):
+    """
+    Override or provide browser fixture with manual Chromium path.
+    This fixture launches a browser using the manually installed Chromium.
+    """
+    from playwright.async_api import async_playwright
+
+    launch_args = playwright_browser_launch_args
+    async with async_playwright() as p:
+        chromium_browser = await p.chromium.launch(**launch_args)
+        yield chromium_browser
+        await chromium_browser.close()
+
+
+@pytest.fixture(scope="function")
+async def page(browser):
+    """Provide page fixture using the manually-launched browser."""
+    context = await browser.new_context()
+    page_instance = await context.new_page()
+    yield page_instance
+    await page_instance.close()
+    await context.close()
+
+
 @pytest.fixture
 def temp_session_file():
     """Create a temporary session file for testing.
