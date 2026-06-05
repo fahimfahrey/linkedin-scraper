@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-scraper
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount database for persistence
+      - ./linkedin_profiles.db:/app/linkedin_profiles.db
+      # Mount session cache for persistence
+      - ./session_cache:/app/session_cache
+      # Mount output directory for exports
+      - ./exports:/app/exports
+    environment:
+      # Override these with your .env values
+      LINKEDIN_EMAIL: ${LINKEDIN_EMAIL}
+      LINKEDIN_PASSWORD: ${LINKEDIN_PASSWORD}
+      # Playwright settings
+      PLAYWRIGHT_HEADLESS: "true"
+      # Optional: Set platform override if needed
+      # PLAYWRIGHT_HOST_PLATFORM_OVERRIDE: "ubuntu24.04-x64"
+    restart: unless-stopped
+    # Uncomment if you need GPU support (e.g., for headless video encoding)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Optional: Dedicated reverse proxy if running on public network
+  # nginx:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - scraper
+
+volumes:
+  session_cache:
+  exports:

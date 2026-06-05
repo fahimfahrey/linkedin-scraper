@@ -122,6 +122,8 @@ Ubuntu 26.04 uses glibc 2.39+ and newer system libraries. **Critical issue:** Pl
 
 ## Step-by-Step Installation
 
+> **Quick tip:** For detailed installation instructions, dependency troubleshooting, or Docker setup, see [INSTALL.md](INSTALL.md) and [docs/PLAYWRIGHT_SETUP.md](docs/PLAYWRIGHT_SETUP.md).
+
 ### 1. Clone Repository
 
 ```bash
@@ -136,11 +138,11 @@ python -m venv venv
 source venv/bin/activate
 ```
 
-### 3. **[CRITICAL] Set PLAYWRIGHT_HOST_PLATFORM_OVERRIDE for Ubuntu 26.04**
+### 3. **[CRITICAL] Set PLAYWRIGHT_HOST_PLATFORM_OVERRIDE for Ubuntu 24.04+**
 
-⚠️ **This step is essential on Ubuntu 26.04. Skipping it will cause Chromium driver mismatches.**
+⚠️ **This step is essential on Ubuntu 24.04 and later. Skipping it will cause browser driver mismatches.**
 
-Playwright auto-detects the platform and downloads matching browser binaries. On Ubuntu 26.04, auto-detection fails (selects `ubuntu22.04-x64`), causing glibc incompatibility. Explicitly override:
+Playwright auto-detects the platform and downloads matching browser binaries. On newer Ubuntu versions, auto-detection may fail, causing compatibility issues. Explicitly override:
 
 ```bash
 export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
@@ -156,20 +158,17 @@ source ~/.bashrc
 
 Or add to `.env` file (see [Environment Variables](#environment-variables--configuration)).
 
-**Validation:** After setting override, verify installation:
+### 4. Install System Dependencies (Ubuntu/Debian)
+
+For Ubuntu 24.04 or later, run the automated setup script:
 
 ```bash
-python -m playwright install
-python -m playwright install-deps
+./scripts/setup-playwright-deps.sh
 ```
 
-If successful, you'll see:
-```
-Downloading Chromium 123.0.6312.4 (ubuntu24.04-x64)...
-✓ 100% | Chromium
-```
+For other systems, see [docs/PLAYWRIGHT_SETUP.md](docs/PLAYWRIGHT_SETUP.md#troubleshooting) for manual installation instructions.
 
-### 4. Install Python Dependencies
+### 5. Install Python Dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -184,16 +183,22 @@ pip install -r requirements.txt
 - `pytest` / `pytest-asyncio` — testing framework
 - `openpyxl` — Excel export (optional but recommended)
 
-### 5. Verify Playwright Installation
+### 6. Install Playwright Browsers
 
 ```bash
 python -m playwright install
-python -m playwright install-deps
 ```
 
 This downloads Chromium, Firefox, and WebKit browsers (only Chromium needed; others optional).
 
-### 6. Configure Credentials
+**Troubleshooting:** If you see warnings about missing system dependencies, run:
+```bash
+python -m playwright install --with-deps
+```
+
+See [docs/PLAYWRIGHT_SETUP.md](docs/PLAYWRIGHT_SETUP.md) for detailed troubleshooting.
+
+### 7. Configure Credentials
 
 Copy `.env.example` to `.env`:
 
@@ -214,7 +219,7 @@ LOG_LEVEL=INFO
 
 **Security reminder:** `.env` is in `.gitignore` and should never be committed.
 
-### 7. Initialize Database
+### 8. Initialize Database
 
 ```bash
 python -c "from database import init_db; init_db()"
@@ -234,7 +239,7 @@ All assertions passed. DB layer functional.
    1  https://www.linked... Test User Software Engineer  ...
 ```
 
-### 8. Start Streamlit Application
+### 9. Start Streamlit Application
 
 ```bash
 streamlit run app.py
