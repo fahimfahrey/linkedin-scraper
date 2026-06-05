@@ -13,7 +13,7 @@ from typing import Optional, Dict, List
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, BrowserContext, Page
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,8 @@ async def create_stealth_context(browser) -> BrowserContext:
         ),
         viewport={"width": 1920, "height": 1080},
     )
-    await stealth_async(context)
+    stealth = Stealth()
+    await stealth.apply_stealth_async(context)
     logger.info("Stealth context created with evasion patches")
     return context
 
