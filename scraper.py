@@ -49,13 +49,56 @@ CHROMIUM_LAUNCH_ENV = get_chromium_environment()
 
 # === Anti-Ban Guardrails ===
 
+class SystemStateSnapshot:
+    """Captures runtime state at incident time for forensics."""
+
+    def __init__(
+        self,
+        profiles_collected: int,
+        anomaly_type: str,
+        anomaly_details: dict,
+        browser_url: str = "",
+        page_title: str = "",
+        memory_usage_mb: float = 0.0,
+        execution_duration_sec: float = 0.0,
+    ):
+        self.timestamp = datetime.now().isoformat()
+        self.profiles_collected = profiles_collected
+        self.anomaly_type = anomaly_type
+        self.anomaly_details = anomaly_details
+        self.browser_url = browser_url
+        self.page_title = page_title
+        self.memory_usage_mb = memory_usage_mb
+        self.execution_duration_sec = execution_duration_sec
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary."""
+        return {
+            "timestamp": self.timestamp,
+            "profiles_collected": self.profiles_collected,
+            "anomaly_type": self.anomaly_type,
+            "anomaly_details": self.anomaly_details,
+            "browser_url": self.browser_url,
+            "page_title": self.page_title,
+            "memory_usage_mb": self.memory_usage_mb,
+            "execution_duration_sec": self.execution_duration_sec,
+        }
+
+    def to_json_line(self) -> str:
+        """Convert to JSON string for line-based logging."""
+        import json
+        return json.dumps(self.to_dict())
+
+
 class ExecutionWindowController:
-    """Tracks daily profile count and enforces hard limits."""
+    """Tracks daily profile count and enforces hard limits with graduated warnings."""
 
     def __init__(self, max_profiles_per_day: int = 45, state_file: str = "execution_window.json"):
         self.max_profiles_per_day = max_profiles_per_day
         self.state_file = state_file
         self.state = self._load_state()
+        self.soft_warning_threshold = int(max_profiles_per_day * 0.8)  # 80%
+        self.critical_warning_threshold = int(max_profiles_per_day * 0.9)  # 90%
 
     def _load_state(self) -> dict:
         """Load state from JSON file, handle missing/corrupted files."""
@@ -83,30 +126,47 @@ class ExecutionWindowController:
             self._save_state()
             logger.info(f"Execution window reset: new day detected. Reset count: {self.state['reset_count']}")
 
+    def get_state(self) -> dict:
+        """Export current state for snapshots and forensics."""
+        return {
+            "date": self.state.get("date"),
+            "count": self.state.get("count", 0),
+            "reset_count": self.state.get("reset_count", 0),
+            "max_profiles": self.max_profiles_per_day,
+        }
+
+    async def increment_reset_count(self) -> None:
+        """Increment daily reset counter."""
+        self.state["reset_count"] = self.state.get("reset_count", 0) + 1
+        self._save_state()
+
     async def check_and_increment(self) -> bool:
         """
-        Increment counter, check if under limit.
-
-        Returns:
-            True if under limit, False otherwise.
+        Increment counter, emit graduated warnings, check if under limit.
 
         Raises:
-            ExecutionWindowExceeded: If at or over limit.
+            ExecutionWindowExceeded: If at or over hard limit.
         """
         await self.reset_if_new_day()
 
         if self.state["count"] >= self.max_profiles_per_day:
-            logger.warning(f"Daily limit reached: {self.state['count']}/{self.max_profiles_per_day}")
+            logger.critical(f"HARD LIMIT EXCEEDED: {self.state['count']}/{self.max_profiles_per_day}")
             raise ExecutionWindowExceeded(
                 f"Daily profile limit ({self.max_profiles_per_day}) exceeded"
             )
 
         self.state["count"] += 1
 
-        # Log warning at 35+ profiles
-        if self.state["count"] >= 35:
+        # Graduated warnings
+        if self.state["count"] == self.critical_warning_threshold:
             logger.warning(
-                f"Daily limit approaching: {self.state['count']}/{self.max_profiles_per_day} profiles"
+                f"CRITICAL: {self.state['count']}/{self.max_profiles_per_day} profiles. "
+                f"Only {self.max_profiles_per_day - self.state['count']} remaining."
+            )
+        elif self.state["count"] == self.soft_warning_threshold:
+            logger.warning(
+                f"WARNING: {self.state['count']}/{self.max_profiles_per_day} profiles (80% threshold). "
+                f"{self.max_profiles_per_day - self.state['count']} profiles remaining."
             )
 
         self._save_state()
@@ -114,30 +174,28 @@ class ExecutionWindowController:
 
 
 class AnomalyDetector:
-    """Detects suspicious platform responses (CAPTCHA, logout, rate limits, redirects)."""
+    """Detects suspicious platform responses with multi-vector detection."""
 
-    def __init__(self):
+    def __init__(self, url_history_limit: int = 10):
         # Precompile regex patterns for performance
-        self.captcha_pattern = re.compile(r"recaptcha|hcaptcha|challenge", re.IGNORECASE)
-        self.logout_pattern = re.compile(r"sign.?in|log.?in", re.IGNORECASE)
+        self.captcha_pattern = re.compile(r"recaptcha|hcaptcha|challenge|verify.*identity", re.IGNORECASE)
+        self.logout_pattern = re.compile(r"sign.?in|log.?in|authenticate", re.IGNORECASE)
         self.rate_limit_pattern = re.compile(
-            r"rate.?limit|too.?many|slow.?down|try.?again", re.IGNORECASE
+            r"rate.?limit|too.?many|slow.?down|try.?again|429|503", re.IGNORECASE
         )
         self.known_paths = {"/in/", "/company/", "/search/", "/jobs/"}
+        self.url_history_limit = url_history_limit
         self.url_history = []
+        self.rate_limit_failure_count = 0
 
     async def inspect_page(self, page: Page) -> Optional[str]:
-        """
-        Run all detection patterns on page.
-
-        Returns:
-            Anomaly type string ('captcha', 'forced_logout', 'rate_limit', 'redirect_anomaly')
-            or None if no anomaly detected.
-        """
+        """Run all detection patterns on page. Returns anomaly type or None."""
         try:
             page_content = await page.content()
             page_url = page.url
             page_title = await page.title()
+
+            self._track_url(page_url)
 
             # Check for CAPTCHA
             if self._detect_captcha(page_content, page_url, page_title):
@@ -151,8 +209,12 @@ class AnomalyDetector:
 
             # Check for rate limit
             if self._detect_rate_limit(page_content):
-                logger.critical("SECURITY INCIDENT: Rate limit detected. Emergency shutdown initiated.")
-                return "rate_limit"
+                self.rate_limit_failure_count += 1
+                if self.rate_limit_failure_count >= 2:
+                    logger.critical("SECURITY INCIDENT: Rate limit detected. Emergency shutdown initiated.")
+                    return "rate_limit"
+            else:
+                self.reset_failure_count()
 
             # Check for redirect anomaly
             if self._detect_redirect_anomaly(page_url):
@@ -164,22 +226,29 @@ class AnomalyDetector:
             logger.warning(f"Anomaly detection failed: {e}")
             return None
 
+    def _track_url(self, url: str) -> None:
+        """Maintain rolling URL history."""
+        self.url_history.append(url)
+        if len(self.url_history) > self.url_history_limit:
+            self.url_history.pop(0)
+
+    def reset_failure_count(self) -> None:
+        """Reset consecutive failure counter after successful page load."""
+        self.rate_limit_failure_count = 0
+
     def _detect_captcha(self, page_content: str, page_url: str, page_title: str) -> bool:
         """Detect CAPTCHA iframe or challenge elements."""
-        # Regex check on content
         if self.captcha_pattern.search(page_content):
             return True
-        # URL check
         if "challenge" in page_url.lower():
             return True
-        # Title check
         if "verify" in page_title.lower() or "security" in page_title.lower():
             return True
         return False
 
     def _detect_logout(self, page_url: str, page_title: str) -> bool:
         """Detect forced logout (URL/title patterns)."""
-        if "/login" in page_url or "/signup" in page_url:
+        if "/login" in page_url or "/signup" in page_url or "/auth" in page_url:
             return True
         if self.logout_pattern.search(page_title):
             return True
@@ -190,19 +259,138 @@ class AnomalyDetector:
         return bool(self.rate_limit_pattern.search(page_content))
 
     def _detect_redirect_anomaly(self, current_url: str) -> bool:
-        """Track URL history, detect deviation from known paths."""
-        self.url_history.append(current_url)
-
-        # Check if URL deviates from known LinkedIn profile paths
+        """Detect deviation from known paths using URL history."""
         is_valid = any(path in current_url for path in self.known_paths)
         if not is_valid and len(self.url_history) > 1:
-            # Allow initial navigation, but detect soft redirects
-            prev_url = self.url_history[-2] if len(self.url_history) > 1 else None
-            if prev_url and prev_url != current_url and "linkedin.com" in current_url:
-                # Unexpected redirect detected
-                if "/error" in current_url or "session" in current_url:
+            prev_url = self.url_history[-2]
+            if prev_url != current_url and "linkedin.com" in current_url:
+                if "/error" in current_url or "session" in current_url or "/auth/" in current_url:
                     return True
         return False
+
+
+class EmergencyShutdown:
+    """Orchestrates graceful termination with data persistence and logging."""
+
+    def __init__(
+        self,
+        incident_type: str,
+        details: dict,
+        profiles_buffer: List[Dict],
+        db_path: str = "linkedin_profiles.db",
+    ):
+        self.incident_type = incident_type
+        self.details = details
+        self.profiles_buffer = profiles_buffer
+        self.db_path = db_path
+
+    async def execute(
+        self,
+        browser,
+        context,
+        page,
+        window_controller: Optional[ExecutionWindowController],
+        start_time: float,
+    ) -> None:
+        """
+        Execute emergency shutdown sequence: Flush → Log → Cleanup.
+        Order is critical for data integrity.
+        """
+        try:
+            # Phase 1: Flush profiles to SQLite
+            await self._flush_profiles()
+
+            # Phase 2: Log incident state
+            if window_controller:
+                await self._log_incident_state(window_controller, start_time, page)
+
+            # Phase 3: Cleanup browser
+            await self._cleanup_browser(browser, context)
+
+            logger.info(f"Emergency shutdown complete: {self.incident_type}")
+        except Exception as e:
+            logger.error(f"Error during emergency shutdown: {e}", exc_info=True)
+
+    async def _flush_profiles(self) -> None:
+        """Atomically write collected profiles to SQLite."""
+        if not self.profiles_buffer:
+            logger.info("No profiles to flush")
+            return
+
+        try:
+            import asyncio
+            from database import insert_profile_batch
+
+            # Run DB insert in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, insert_profile_batch, self.profiles_buffer)
+            logger.info(f"Flushed {len(self.profiles_buffer)} profiles to database")
+        except Exception as e:
+            logger.error(f"Failed to flush profiles: {e}", exc_info=True)
+
+    async def _log_incident_state(
+        self,
+        window_controller: ExecutionWindowController,
+        start_time: float,
+        page: Optional[Page],
+    ) -> None:
+        """Serialize system state snapshot to security_incidents.log."""
+        try:
+            page_url = page.url if page else "N/A"
+            page_title = (await page.title()) if page else "N/A"
+
+            # Calculate memory usage
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+
+            snapshot = SystemStateSnapshot(
+                profiles_collected=len(self.profiles_buffer),
+                anomaly_type=self.incident_type,
+                anomaly_details=self.details,
+                browser_url=page_url,
+                page_title=page_title,
+                memory_usage_mb=memory_mb,
+                execution_duration_sec=time.time() - start_time,
+            )
+
+            # Append to security_incidents.log as JSON line
+            with open("security_incidents.log", "a") as f:
+                f.write(snapshot.to_json_line() + "\n")
+
+            logger.info(f"Incident state logged to security_incidents.log")
+        except Exception as e:
+            logger.error(f"Failed to log incident state: {e}", exc_info=True)
+
+    async def _cleanup_browser(self, browser, context) -> None:
+        """Close browser resources. Wraps exceptions but continues."""
+        try:
+            if context:
+                await context.close()
+                logger.debug("Browser context closed")
+        except Exception as e:
+            logger.warning(f"Context close failed: {e}")
+
+        try:
+            if browser:
+                await browser.close()
+                logger.debug("Browser closed")
+        except Exception as e:
+            logger.warning(f"Browser close failed: {e}")
+            # Fallback: attempt OS-level process termination
+            try:
+                import subprocess
+                import psutil
+
+                for proc in psutil.process_iter(["pid", "name"]):
+                    try:
+                        if "chrome" in proc.info["name"].lower():
+                            proc.terminate()
+                            logger.info(f"Terminated orphaned process: {proc.info['pid']}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except ImportError:
+                logger.warning("psutil not available for fallback cleanup")
 
 
 async def safe_browser_cleanup(browser, context) -> None:
@@ -1074,6 +1262,28 @@ async def scrape_profile(context: BrowserContext, profile_url: str) -> Dict[str,
     return await traverse_profile(context, profile_url, expand_all=True)
 
 
+async def _handle_security_incident(
+    incident_type: str,
+    details: dict,
+    profiles_collected_buffer: List[Dict],
+    browser,
+    context,
+    page,
+    window_controller: Optional[ExecutionWindowController],
+    start_time: float,
+) -> None:
+    """Centralized security incident handler. Orchestrates emergency shutdown."""
+    try:
+        shutdown = EmergencyShutdown(
+            incident_type=incident_type,
+            details=details,
+            profiles_buffer=profiles_collected_buffer,
+        )
+        await shutdown.execute(browser, context, page, window_controller, start_time)
+    except Exception as e:
+        logger.error(f"Error handling security incident: {e}", exc_info=True)
+
+
 async def scrape_profile_batch(
     urls: List[str],
     message_queue: queue.Queue,
@@ -1084,10 +1294,10 @@ async def scrape_profile_batch(
     stop_event: Optional[threading.Event] = None,
 ) -> None:
     """
-    Batch scrape LinkedIn profiles and emit messages to queue.
+    Batch scrape LinkedIn profiles with safety guardrails.
 
-    Handles browser lifecycle, profile iteration, and error recovery.
-    All messages are sent to message_queue for UI consumption.
+    Enforces daily limits, detects anomalies, and gracefully shuts down
+    with data persistence on security incidents or limit exceeded.
 
     Args:
         urls: List of LinkedIn profile URLs to scrape.
@@ -1104,8 +1314,11 @@ async def scrape_profile_batch(
     p = None
     browser = None
     context = None
+    page = None
     profiles_collected = 0
+    profiles_buffer: List[Dict] = []
     start_time = time.time()
+    incident_triggered = False
 
     try:
         # Initialize controllers
@@ -1137,6 +1350,17 @@ async def scrape_profile_batch(
 
                 # Scrape profile
                 profile_data = await scrape_profile(context, profile_url)
+                page = context.pages[0] if context.pages else None
+
+                # Check for anomalies after profile load
+                anomaly = await anomaly_detector.inspect_page(page) if page else None
+                if anomaly:
+                    profiles_buffer.append(profile_data)
+                    incident_triggered = True
+                    raise SecurityIncidentDetected(anomaly, {"detected_during": "profile_scrape"})
+
+                # Add to buffer for later flush
+                profiles_buffer.append(profile_data)
 
                 # Emit status: stored
                 status_msg = StatusUpdate(
@@ -1163,6 +1387,17 @@ async def scrape_profile_batch(
 
             except ExecutionWindowExceeded as e:
                 logger.error(f"Execution window exceeded at profile {idx}: {e}")
+                incident_triggered = True
+                await _handle_security_incident(
+                    incident_type="execution_window_exceeded",
+                    details={"profile_index": idx, "limit_reached": window_controller.max_profiles_per_day},
+                    profiles_collected_buffer=profiles_buffer,
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    window_controller=window_controller,
+                    start_time=start_time,
+                )
                 warn_msg = OperationWarning(
                     worker_id=worker_id,
                     severity="critical",
@@ -1174,6 +1409,16 @@ async def scrape_profile_batch(
 
             except SecurityIncidentDetected as e:
                 logger.error(f"Security incident at profile {idx}: {e.anomaly_type}")
+                await _handle_security_incident(
+                    incident_type=e.anomaly_type,
+                    details=e.details,
+                    profiles_collected_buffer=profiles_buffer,
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    window_controller=window_controller,
+                    start_time=start_time,
+                )
                 warn_msg = OperationWarning(
                     worker_id=worker_id,
                     severity="critical",
@@ -1185,7 +1430,6 @@ async def scrape_profile_batch(
 
             except Exception as e:
                 logger.warning(f"Failed to scrape profile {idx} ({profile_url}): {e}")
-                # Emit warning but continue
                 warn_msg = OperationWarning(
                     worker_id=worker_id,
                     severity="warning",
@@ -1197,7 +1441,7 @@ async def scrape_profile_batch(
         # Emit completion
         complete_msg = ExecutionComplete(
             worker_id=worker_id,
-            success=True,
+            success=not incident_triggered,
             profiles_collected=profiles_collected,
             total_queued=len(urls),
         )

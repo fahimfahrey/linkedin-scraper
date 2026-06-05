@@ -48,6 +48,16 @@ def insert_profile(profile: dict, db_path: str = DB_PATH) -> bool:
     return inserted
 
 
+def insert_profile_batch(profiles: list, db_path: str = DB_PATH) -> int:
+    """Batch insert profiles into database. Returns count of inserted profiles."""
+    count = 0
+    for profile in profiles:
+        if insert_profile(profile, db_path):
+            count += 1
+    logger.info(f"Batch insert complete: {count}/{len(profiles)} profiles inserted")
+    return count
+
+
 def get_profiles_df(db_path: str = DB_PATH) -> pd.DataFrame:
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query("SELECT * FROM linkedin_profiles", conn)
