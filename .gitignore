@@ -40,6 +40,10 @@ config.json
 *.json
 !.github/workflows/*.json
 
+# Session files (authentication data)
+session.json
+.auth/
+
 # IDE & Editor
 .vscode/
 .idea/
