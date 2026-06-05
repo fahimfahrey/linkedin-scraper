@@ -236,3 +236,172 @@ def prepare_profiles_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df_display["Collected"] = df_display["Collected"].dt.strftime("%Y-%m-%d %H:%M")
 
     return df_display.sort_values("Collected", ascending=False)
+
+
+# --- URL validation -------------------------------------------------------
+
+def split_url_validation(text: str) -> Tuple[list, list]:
+    """Split pasted text into (valid, invalid) LinkedIn profile URLs.
+
+    A line is valid when it contains "linkedin.com/in/". Blank lines ignored.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    valid = [u for u in lines if "linkedin.com/in/" in u]
+    invalid = [u for u in lines if "linkedin.com/in/" not in u]
+    return valid, invalid
+
+
+# --- Data shaping for the Data page ---------------------------------------
+
+def _count_json(value) -> int:
+    if pd.isna(value) or not value:
+        return 0
+    try:
+        data = json.loads(value)
+        return len(data) if isinstance(data, list) else 0
+    except Exception:
+        return 0
+
+
+def prepare_profiles_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a display table that keeps linkedin_url (for LinkColumn) + counts.
+
+    Distinct from prepare_profiles_dataframe (which drops the URL). Used by the
+    Data page with st.dataframe column_config.
+    """
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Name", "Headline", "Location", "Company", "Jobs", "Degrees", "Profile", "Collected"]
+        )
+
+    out = pd.DataFrame()
+    out["Name"] = df["full_name"]
+    out["Headline"] = df["headline"]
+    out["Location"] = df["location"]
+    out["Company"] = df["current_company"]
+    out["Jobs"] = df["experience_json"].apply(_count_json)
+    out["Degrees"] = df["education_json"].apply(_count_json)
+    out["Profile"] = df["linkedin_url"]
+    out["Collected"] = pd.to_datetime(df["collected_at"])
+    return out.sort_values("Collected", ascending=False)
+
+
+def filter_profiles(df: pd.DataFrame, companies: list, search: str) -> pd.DataFrame:
+    """Filter raw profile df by company list and free-text search (name/headline)."""
+    if df.empty:
+        return df
+    out = df
+    if companies:
+        out = out[out["current_company"].isin(companies)]
+    term = (search or "").strip().lower()
+    if term:
+        name = out["full_name"].fillna("").str.lower()
+        head = out["headline"].fillna("").str.lower()
+        out = out[name.str.contains(term) | head.str.contains(term)]
+    return out
+
+
+def top_companies(df: pd.DataFrame, n: int = 8) -> pd.DataFrame:
+    """Return top-n companies by profile count as a DataFrame (index=company)."""
+    if df.empty or "current_company" not in df:
+        return pd.DataFrame({"Profiles": []})
+    counts = df["current_company"].dropna().value_counts().head(n)
+    return counts.rename("Profiles").to_frame()
+
+
+def collection_timeline(df: pd.DataFrame) -> pd.DataFrame:
+    """Return profiles-collected-per-day as a DataFrame (index=date)."""
+    if df.empty:
+        return pd.DataFrame({"Profiles": []})
+    dates = pd.to_datetime(df["collected_at"]).dt.date
+    counts = dates.value_counts().sort_index()
+    out = counts.rename("Profiles").to_frame()
+    out.index = pd.to_datetime(out.index)
+    out.index.name = "Date"
+    return out
+
+
+# --- Shared render components ----------------------------------------------
+
+def render_sidebar_session(session_file: str = "session.json") -> None:
+    """Render pinned session-status badge + auth shortcut in the sidebar.
+
+    Replaces the old display_validation_sidebar layout; works under st.navigation.
+    """
+    import streamlit as st
+    import ui_theme
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Session**")
+
+    if not st.session_state.get("session_validated", False) or st.session_state.get("validation_timestamp") is None:
+        is_valid, status_msg, expiry_info = validate_session_file(session_file)
+        st.session_state.session_validated = is_valid
+        st.session_state.validation_status = status_msg
+        st.session_state.validation_expiry = expiry_info
+        st.session_state.validation_timestamp = datetime.now()
+
+    if st.session_state.get("session_validated"):
+        ui_theme.render_badge("Session active", "valid")
+    else:
+        ui_theme.render_badge("No valid session", "invalid")
+
+    if st.session_state.get("validation_expiry"):
+        st.sidebar.caption(st.session_state.validation_expiry)
+
+    path = Path(session_file)
+    if path.exists():
+        st.sidebar.caption(f"📁 {path.stat().st_size / 1024:.1f} KB")
+
+    if st.sidebar.button("🔄 Re-check session", use_container_width=True, key="recheck_session"):
+        st.session_state.session_validated = False
+        st.rerun()
+
+
+def render_profile_detail(profile: dict) -> None:
+    """Render a single profile's full detail (used inside st.dialog)."""
+    import streamlit as st
+
+    st.subheader(profile.get("full_name") or "Unknown")
+    if profile.get("headline"):
+        st.caption(profile["headline"])
+
+    meta_cols = st.columns(2)
+    with meta_cols[0]:
+        st.markdown(f"**Location:** {profile.get('location') or '—'}")
+    with meta_cols[1]:
+        st.markdown(f"**Company:** {profile.get('current_company') or '—'}")
+
+    url = profile.get("linkedin_url")
+    if url:
+        st.markdown(f"🔗 [Open LinkedIn profile]({url})")
+
+    if profile.get("about_text"):
+        st.markdown("**About**")
+        st.write(profile["about_text"])
+
+    _render_json_section("Experience", profile.get("experience_json"))
+    _render_json_section("Education", profile.get("education_json"))
+
+
+def _render_json_section(title: str, raw) -> None:
+    import streamlit as st
+
+    if not raw:
+        return
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(items, list) or not items:
+        return
+
+    st.markdown(f"**{title}**")
+    for item in items:
+        if isinstance(item, dict):
+            primary = item.get("title") or item.get("degree") or item.get("school") or ""
+            secondary = item.get("company") or item.get("school") or item.get("field") or ""
+            line = " — ".join([p for p in (primary, secondary) if p]) or json.dumps(item)
+            st.markdown(f"- {line}")
+        else:
+            st.markdown(f"- {item}")

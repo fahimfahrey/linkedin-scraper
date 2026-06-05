@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 
 from queue_protocol import StatusUpdate, ProfilePayload, OperationWarning, ExecutionComplete
 from environment_config import get_chromium_environment
+from src.browser_config import get_browser_launch_args
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,11 @@ class SecurityIncidentDetected(Exception):
 
 # Ubuntu Chromium environment configuration for headless Linux execution
 CHROMIUM_LAUNCH_ENV = get_chromium_environment()
+
+# Manual Chromium launch args (executable_path -> /usr/bin/chromium-browser).
+# Playwright cannot download a bundled browser for ubuntu26.04-x64, so point it
+# at the system Chromium instead.
+CHROMIUM_LAUNCH_ARGS = get_browser_launch_args()
 
 
 # === Anti-Ban Guardrails ===
@@ -468,6 +474,7 @@ async def launch_stealth_browser():
                 "--single-process",
             ],
             env=CHROMIUM_LAUNCH_ENV,
+            **CHROMIUM_LAUNCH_ARGS,
         )
         logger.info("Stealth browser launched successfully")
         return p, browser
