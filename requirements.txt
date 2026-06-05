@@ -6,3 +6,5 @@ pydantic
 streamlit
 pytest
 pytest-asyncio
+openpyxl
+pytest-cov

@@ -1,12 +1,8 @@
 """Pytest configuration and fixtures for session manager tests."""
-
 import json
 import pytest
 import tempfile
 from pathlib import Path
-
-pytest_plugins = ("pytest_asyncio",)
-
 
 from session_manager import SessionManager
 
@@ -14,18 +10,11 @@ from session_manager import SessionManager
 @pytest.fixture
 def temp_session_file():
     """Create a temporary session file for testing.
-
     Yields path to temporary file that is cleaned up after test.
     """
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        delete=False
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         temp_path = f.name
-
     yield Path(temp_path)
-
     # Cleanup
     temp_file = Path(temp_path)
     if temp_file.exists():
@@ -51,18 +40,16 @@ def dummy_session_state():
                 "expires": 9999999999,
                 "httpOnly": True,
                 "secure": True,
-                "sameSite": "None"
+                "sameSite": "None",
             }
         ],
         "origins": [
             {
                 "origin": "https://www.linkedin.com",
-                "localStorage": [
-                    {"name": "test_key", "value": "test_value"}
-                ],
-                "sessionStorage": []
+                "localStorage": [{"name": "test_key", "value": "test_value"}],
+                "sessionStorage": [],
             }
-        ]
+        ],
     }
 
 
