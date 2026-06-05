@@ -515,7 +515,7 @@ async def traverse_profile(
         await scroll_profile_page(page, step_range=(200, 400))
 
         # Extract basic profile metadata
-        profile_data = await extract_profile_metadata(page, profile_url)
+        profile_data = await extract_profile_with_beautifulsoup(page, profile_url)
 
         logger.info(f"Profile traversal complete for {profile_url}")
         return profile_data
@@ -912,6 +912,8 @@ async def extract_profile_with_beautifulsoup(page: Page, profile_url: str) -> Di
 		"jobs": [],
 		"schools": [],
 	}
+
+	logger.info(f"Starting profile extraction for {profile_url}")
 
 	try:
 		# Get full page HTML from Playwright
