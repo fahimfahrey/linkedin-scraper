@@ -881,6 +881,29 @@ pytest tests/test_session_manager.py -v
 - Session export/import
 - Cookie validation
 
+### Playwright Setup (Ubuntu 26.04 with Manual Chromium)
+
+This project uses a manually installed Chromium browser at `/usr/bin/chromium-browser` due to missing system dependencies in Ubuntu 26.04.
+
+**Installation:**
+1. Verify Chromium is installed: `which chromium-browser` or `ls -la /usr/bin/chromium-browser`
+2. Install Python dependencies: `pip install -r requirements.txt`
+3. Run browser setup tests:
+   ```bash
+   pytest tests/test_browser_setup.py -v
+   ```
+
+**What the tests verify:**
+- Chromium executable exists at `/usr/bin/chromium-browser`
+- Chromium has execute permission
+- Chromium responds to `--version` flag
+- Playwright can launch and use manual Chromium
+
+**Troubleshooting:**
+- If Chromium not found: `sudo apt-get install chromium-browser`
+- If "permission denied": `chmod +x /usr/bin/chromium-browser`
+- If test hangs on browser launch: Check system dependencies with `/usr/bin/chromium-browser --version`
+
 ### Integration Tests
 
 Test end-to-end flows (thread spawning, message consumption):
